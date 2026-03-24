@@ -5,10 +5,11 @@ namespace App\Services\Export;
 final class CsvExporter
 {
     /**
-     * @param array<int,string> $templateColumns
-     * @param array<int,array<string,string>> $rows
+     * @param  array<int, string>  $templateColumns  Ключи в $rows
+     * @param  array<int, array<string, string>>  $rows
+     * @param  array<int, string>|null  $headerRow  Если задано — первая строка CSV (допускаются дубликаты подписей)
      */
-    public function exportToPath(array $templateColumns, array $rows, string $path): void
+    public function exportToPath(array $templateColumns, array $rows, string $path, ?array $headerRow = null): void
     {
         $dir = dirname($path);
         if (!is_dir($dir)) {
@@ -25,7 +26,10 @@ final class CsvExporter
 
         $delimiter = ';';
 
-        fputcsv($fh, $templateColumns, $delimiter);
+        $headers = $headerRow !== null && count($headerRow) === count($templateColumns)
+            ? $headerRow
+            : $templateColumns;
+        fputcsv($fh, $headers, $delimiter);
 
         foreach ($rows as $row) {
             $line = [];

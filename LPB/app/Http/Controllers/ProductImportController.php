@@ -18,6 +18,7 @@ use App\Services\Supplier\SupplierMappingLoader;
 use App\Services\Supplier\SupplierRegistry;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 final class ProductImportController extends Controller
@@ -45,6 +46,7 @@ final class ProductImportController extends Controller
             'file' => ['required', 'file'],
             'export_xlsx' => ['nullable', 'boolean'],
             'export_csv' => ['nullable', 'boolean'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
         ]);
 
         $supplier = (string) $validated['supplier'];
@@ -119,6 +121,7 @@ final class ProductImportController extends Controller
                 'supplier_name' => $supplierCfg['supplier_name'],
                 'export_xlsx' => $exportXlsx,
                 'export_csv' => $exportCsv,
+                'liewood_photo_csv_links' => (string) $validated['liewood_photo_csv_links'],
             ],
             'template_columns' => $templateColumns,
             'supplier_headers' => $supplierHeaders,
@@ -146,6 +149,7 @@ final class ProductImportController extends Controller
             'export_xlsx' => ['required', 'boolean'],
             'export_csv' => ['required', 'boolean'],
             'mapping' => ['nullable', 'array'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
         ]);
 
         $supplier = (string) $validated['supplier'];
@@ -277,6 +281,7 @@ final class ProductImportController extends Controller
                 'export_xlsx' => $exportXlsx,
                 'export_csv' => $exportCsv,
                 'mapping' => $finalMapping,
+                'liewood_photo_csv_links' => (string) $validated['liewood_photo_csv_links'],
             ],
             'rules' => $rules,
             'ai_unavailable' => $aiUnavailable,
@@ -298,6 +303,7 @@ final class ProductImportController extends Controller
             'export_csv' => ['required', 'boolean'],
             'mapping' => ['required', 'array'],
             'rules' => ['nullable', 'array'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
         ]);
 
         $supplier = (string)$validated['supplier'];
@@ -368,6 +374,8 @@ final class ProductImportController extends Controller
         $exportXlsx = (bool)$validated['export_xlsx'];
         $exportCsv = (bool)$validated['export_csv'];
 
+        $liewoodGcsUseDownloadProxy = $validated['liewood_photo_csv_links'] === 'download';
+
         $result = $pipeline->run(
             supplierCode: $supplier,
             inputPath: $inputPath,
@@ -375,6 +383,7 @@ final class ProductImportController extends Controller
             exportXlsx: $exportXlsx,
             exportCsv: $exportCsv,
             overrideColumnMapping: $finalMapping,
+            liewoodGcsUseDownloadProxy: $liewoodGcsUseDownloadProxy,
         );
 
         return view('imports.result', [

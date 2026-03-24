@@ -8,10 +8,13 @@ use App\Services\Ai\AiDatasetSummaryBuilder;
 use App\Services\Export\CsvExporter;
 use App\Services\Export\TemplateLoader;
 use App\Services\Export\XlsxExporter;
+use App\Models\BrandSkuSetting;
 use App\Services\Sku\LiewoodSkuGenerator;
 use App\Services\Supplier\SupplierMappingLoader;
 use App\Services\Import\ConfirmedRuleApplier;
+use App\Services\Import\SupplierTypeClassificationResolver;
 use App\Services\Import\NormalizationRulesRepository;
+use App\Services\Import\ImportInstructionService;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
 
@@ -32,6 +35,10 @@ final class ConversionPipeline
         private readonly NormalizationRulesRepository $normalizationRulesRepo,
         private readonly ConfirmedRuleApplier $ruleApplier,
         private readonly LiewoodSkuGenerator $liewoodSkuGenerator,
+        private readonly LiewoodGoogleDriveImageFiller $liewoodGoogleDriveImageFiller,
+        private readonly LiewoodRetailTransformer $liewoodRetailTransformer,
+        private readonly SupplierTypeClassificationResolver $supplierTypeClassificationResolver,
+        private readonly ImportInstructionService $importInstructionService,
     ) {
     }
 
@@ -44,7 +51,9 @@ final class ConversionPipeline
         string $originalFilename,
         bool $exportXlsx,
         bool $exportCsv,
-        ?array $overrideColumnMapping = null
+        ?array $overrideColumnMapping = null,
+        ?bool $liewoodGcsUseDownloadProxy = null,
+        ?string $liewoodGcsPrefix = null,
     ): array
     {
         $jobId = (string) Str::uuid();
@@ -57,62 +66,47 @@ final class ConversionPipeline
         $templatePath = (string) config('product_import.template_path');
         $templateColumns = $this->templateLoader->loadTemplateColumns($templatePath);
 
+        $liewoodRetail = $supplierCode === 'liewood'
+            && (bool) config('liewood_retail.enabled', true);
+        if ($liewoodRetail) {
+            $retailCols = config('liewood_retail.template_column_keys');
+            if (is_array($retailCols) && $retailCols !== []) {
+                $templateColumns = array_values($retailCols);
+            }
+        }
+
         $supplierCfg = $this->mappingLoader->load($supplierCode);
         $columnMapping = is_array($overrideColumnMapping) ? $overrideColumnMapping : ($supplierCfg['column_mapping'] ?? []);
 
-        // #region agent log
-        @file_put_contents(
-            base_path('.cursor/debug-9a7511.log'),
-            json_encode([
-                'sessionId' => '9a7511',
-                'runId' => 'debug-brand-sku',
-                'hypothesisId' => 'H3',
-                'location' => 'LPB/app/Services/Import/ConversionPipeline.php:run',
-                'message' => 'Column mapping entering pipeline',
-                'data' => [
-                    'supplier_code' => $supplierCode,
-                    'brand_target' => $columnMapping['Brand'] ?? null,
-                    'style_no_target' => $columnMapping['Style No'] ?? null,
-                    'mapping_count' => is_array($columnMapping) ? count($columnMapping) : null,
-                ],
-                'timestamp' => (int) (microtime(true) * 1000),
-            ]) . PHP_EOL,
-            FILE_APPEND
-        );
-        // #endregion
-
         $parsed = $this->parser->parse($inputPath, $supplierCfg['sheet'] ?? null);
-        $supplierHeaders = $parsed['headers'];
 
         $normalizedRows = $this->normalizer->normalizeRows($parsed['rows']);
-
-        // #region agent log
-        @file_put_contents(
-            base_path('.cursor/debug-9a7511.log'),
-            json_encode([
-                'sessionId' => '9a7511',
-                'runId' => 'debug-brand-sku',
-                'hypothesisId' => 'H4',
-                'location' => 'LPB/app/Services/Import/ConversionPipeline.php:run:beforeMap',
-                'message' => 'Template/header presence check before mapping',
-                'data' => [
-                    'has_template_brend_exact' => in_array('Brend  ', $templateColumns, true),
-                    'has_template_brend_trimmed' => in_array('Brend', $templateColumns, true),
-                    'has_header_brand' => in_array('Brand', $supplierHeaders, true),
-                    'has_header_style_no' => in_array('Style No', $supplierHeaders, true),
-                ],
-                'timestamp' => (int) (microtime(true) * 1000),
-            ]) . PHP_EOL,
-            FILE_APPEND
-        );
-        // #endregion
 
         $mapped = $this->mapper->map($normalizedRows, $columnMapping, $templateColumns);
         $outputRows = $mapped['output_rows'];
         $outputRows = $this->applyCriticalFallbacks($supplierCode, $normalizedRows, $outputRows);
 
+        if ($liewoodRetail) {
+            [$dbFootwear, $dbHat, $dbSocks] = $this->supplierTypeClassificationResolver->extraListsForLiewood($supplierCode);
+            $outputRows = $this->liewoodRetailTransformer->transform($outputRows, $normalizedRows, $dbFootwear, $dbHat, $dbSocks);
+        }
+
         // Deterministic SKU generation for suppliers that require it.
-        $outputRows = $this->applyDeterministicSkuGeneration($supplierCode, $outputRows);
+        $outputRows = $this->applyDeterministicSkuGeneration($supplierCode, $outputRows, $liewoodRetail);
+
+        // Liewood: optional image URLs by filename (LW##### + Color Code), source via config.
+        if ($supplierCode === 'liewood' && $liewoodGcsPrefix !== '__NO_PHOTO__') {
+            $photoSlots = $liewoodRetail
+                ? (array) config('liewood_retail.photo_slots', [])
+                : null;
+            $outputRows = $this->liewoodGoogleDriveImageFiller->fillExportRows(
+                $outputRows,
+                $photoSlots,
+                $liewoodGcsUseDownloadProxy,
+                $liewoodGcsPrefix,
+            );
+        }
+
         $missingSourceColumns = [];
         foreach (($mapped['mapping_status'] ?? []) as $ms) {
             if (($ms['status'] ?? '') === 'missing_source') {
@@ -120,11 +114,14 @@ final class ConversionPipeline
             }
         }
 
-        $required = (array) config('product_import.validation.required_columns', []);
+        $baseRequired = (array) config('product_import.validation.required_columns', []);
+        $mergedRequired = $liewoodRetail
+            ? array_merge($baseRequired, (array) config('liewood_retail.validation', []))
+            : $baseRequired;
         $requiredCols = [
-            'sku' => (string)($required['sku'] ?? 'Sku'),
-            'name' => (string)($required['name'] ?? 'Product name (EN)'),
-            'price' => (string)($required['price'] ?? 'Wholesale Price'),
+            'sku' => (string)($mergedRequired['sku'] ?? 'Sku'),
+            'name' => (string)($mergedRequired['name'] ?? 'Product name (EN)'),
+            'price' => (string)($mergedRequired['price'] ?? 'Wholesale Price EUR'),
         ];
 
         // Validate required columns exist in template (impossible state otherwise).
@@ -145,27 +142,6 @@ final class ConversionPipeline
 
         $validation = $this->validator->validate($outputRows, $requiredCols);
 
-        // #region agent log
-        @file_put_contents(
-            base_path('.cursor/debug-9a7511.log'),
-            json_encode([
-                'sessionId' => '9a7511',
-                'runId' => 'pre-fix',
-                'hypothesisId' => 'H3',
-                'location' => 'LPB/app/Services/Import/ConversionPipeline.php:validation',
-                'message' => 'After validation',
-                'data' => [
-                    'total_rows_before_validation' => count($outputRows),
-                    'rows_valid' => $validation['summary']['rows_valid'] ?? null,
-                    'rows_error' => $validation['summary']['rows_error'] ?? null,
-                    'first_row_sample' => $outputRows[0] ?? null,
-                ],
-                'timestamp' => (int) (microtime(true) * 1000),
-            ]) . PHP_EOL,
-            FILE_APPEND
-        );
-        // #endregion
-
         // Export all non-empty rows: both "valid" and "warning" rows are included.
         // Only completely empty rows (classified as errors) are excluded.
         $rowsForExport = array_merge($validation['valid_rows'], $validation['warning_rows']);
@@ -182,19 +158,29 @@ final class ConversionPipeline
         $exportPaths = [
             'xlsx' => null,
             'csv' => null,
+            'instruction_csv' => null,
+            'instruction_passport_json' => null,
         ];
+
+        $csvHeaderRow = null;
+        if ($liewoodRetail) {
+            $hdr = config('liewood_retail.csv_header_row');
+            if (is_array($hdr) && count($hdr) === count($templateColumns)) {
+                $csvHeaderRow = array_values($hdr);
+            }
+        }
 
         if ($exportXlsx) {
             $xlsxName = (string) config('product_import.export.xlsx_name', 'output.xlsx');
             $xlsxPath = $jobDir . DIRECTORY_SEPARATOR . $xlsxName;
-            $this->xlsxExporter->exportToPath($templateColumns, $rowsForExport, $xlsxPath);
+            $this->xlsxExporter->exportToPath($templateColumns, $rowsForExport, $xlsxPath, $csvHeaderRow);
             $exportPaths['xlsx'] = $xlsxName;
         }
 
         if ($exportCsv) {
             $csvName = (string) config('product_import.export.csv_name', 'output.csv');
             $csvPath = $jobDir . DIRECTORY_SEPARATOR . $csvName;
-            $this->csvExporter->exportToPath($templateColumns, $rowsForExport, $csvPath);
+            $this->csvExporter->exportToPath($templateColumns, $rowsForExport, $csvPath, $csvHeaderRow);
             $exportPaths['csv'] = $csvName;
         }
 
@@ -240,6 +226,26 @@ final class ConversionPipeline
         $previewJsonName = (string) config('product_import.export.preview_json', 'preview.json');
         file_put_contents($jobDir . DIRECTORY_SEPARATOR . $previewJsonName, json_encode($preview, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
+        $passport = $this->importInstructionService->buildPassport(
+            (string) ($supplierCfg['supplier_code'] ?? $supplierCode),
+            (string) ($supplierCfg['supplier_name'] ?? $supplierCode),
+            $templateColumns,
+            (array) ($mapped['mapping_status'] ?? []),
+            [
+                'liewood_retail' => $liewoodRetail,
+                'export_xlsx' => $exportXlsx,
+                'export_csv' => $exportCsv,
+                'example_row' => $rowsForExport[0] ?? [],
+            ],
+        );
+        $instructionRows = $this->importInstructionService->buildInstructionRows($passport);
+        $passportJsonName = (string) config('product_import.export.instruction_passport_json', 'instruction_passport.json');
+        $instructionCsvName = (string) config('product_import.export.instruction_csv_name', 'instruction.csv');
+        $this->importInstructionService->writePassportJson($passport, $jobDir . DIRECTORY_SEPARATOR . $passportJsonName);
+        $this->importInstructionService->writeInstructionCsv($instructionRows, $jobDir . DIRECTORY_SEPARATOR . $instructionCsvName);
+        $exportPaths['instruction_csv'] = $instructionCsvName;
+        $exportPaths['instruction_passport_json'] = $passportJsonName;
+
         return [
             'job_id' => $jobId,
             'preview' => $preview,
@@ -256,21 +262,48 @@ final class ConversionPipeline
      */
     private function applyCriticalFallbacks(string $supplierCode, array $sourceRows, array $outputRows): array
     {
-        if ($supplierCode !== 'liewood') {
+        if ($supplierCode !== 'liewood' && $supplierCode !== 'bobo_choses') {
             return $outputRows;
         }
 
         foreach ($outputRows as $idx => $row) {
             $src = $sourceRows[$idx] ?? [];
 
-            $brand = trim((string)($src['Brand'] ?? ''));
-            if (trim((string)($row['Brend  '] ?? '')) === '' && $brand !== '') {
-                $row['Brend  '] = $brand;
+            if ($supplierCode === 'liewood') {
+                $brand = trim((string)($src['Brand'] ?? ''));
+                foreach (['Brend', 'Brend  '] as $bk) {
+                    if (array_key_exists($bk, $row) && trim((string)($row[$bk] ?? '')) === '' && $brand !== '') {
+                        $row[$bk] = $brand;
+                    }
+                }
+
+                $styleNo = trim((string)($src['Style No'] ?? ''));
+                // Retail template: "Supplier product ID"; legacy master: "Supplier Product ID"
+                foreach (['Supplier product ID', 'Supplier Product ID', 'Style no', 'Sku Brand'] as $sk) {
+                    if (array_key_exists($sk, $row) && trim((string)($row[$sk] ?? '')) === '' && $styleNo !== '') {
+                        $row[$sk] = $styleNo;
+                    }
+                }
             }
 
-            $styleNo = trim((string)($src['Style No'] ?? ''));
-            if (trim((string)($row['Supplier Product ID'] ?? '')) === '' && $styleNo !== '') {
-                $row['Supplier Product ID'] = $styleNo;
+            if ($supplierCode === 'bobo_choses') {
+                // Always fill brand when template brand is empty.
+                // Must match UI/label expectation exactly: "Bobo Choses".
+                $brandTargetKeys = [
+                    'Brend  ', // template column name in current app
+                    'Brend',   // just in case spaces trimmed
+                    'Brend (manufacturer)',
+                    'PRODUCENT',
+                ];
+                foreach ($brandTargetKeys as $k) {
+                    if (!array_key_exists($k, $row)) continue;
+                    $current = trim((string)($row[$k] ?? ''));
+                    $isEmpty = $current === '';
+                    $isJustB = mb_strtoupper($current) === 'B';
+                    if ($isEmpty || $isJustB) {
+                        $row[$k] = 'Bobo Choses';
+                    }
+                }
             }
 
             $outputRows[$idx] = $row;
@@ -283,17 +316,37 @@ final class ConversionPipeline
      * @param array<int,array<string,string>> $rows
      * @return array<int,array<string,string>>
      */
-    private function applyDeterministicSkuGeneration(string $supplierCode, array $rows): array
+    private function applyDeterministicSkuGeneration(string $supplierCode, array $rows, bool $liewoodRetail = false): array
     {
         if ($supplierCode !== 'liewood') {
             return $rows;
         }
 
         $required = (array) config('product_import.validation.required_columns', []);
-        $skuColumn = (string)($required['sku'] ?? 'Sku');
+        $skuColumn = $liewoodRetail
+            ? (string) config('liewood_retail.validation.sku', 'SKU')
+            : (string)($required['sku'] ?? 'Sku');
+
+        $setting = BrandSkuSetting::query()->where('supplier_code', $supplierCode)->first();
+        $mode = $setting?->mode ?? 'file_then_formula';
+        $sizePriority = $setting?->size_column_priority;
 
         foreach ($rows as $idx => $row) {
-            $rows[$idx] = $this->liewoodSkuGenerator->fillSkuIfMissing($row, $skuColumn);
+            $existing = trim((string) ($row[$skuColumn] ?? ''));
+
+            if ($mode === 'file_only') {
+                continue;
+            }
+
+            if ($mode === 'file_then_formula' && $existing !== '') {
+                continue;
+            }
+
+            if ($mode === 'always_formula') {
+                $row[$skuColumn] = '';
+            }
+
+            $rows[$idx] = $this->liewoodSkuGenerator->fillSkuIfMissing($row, $skuColumn, is_array($sizePriority) ? $sizePriority : null);
         }
 
         return $rows;

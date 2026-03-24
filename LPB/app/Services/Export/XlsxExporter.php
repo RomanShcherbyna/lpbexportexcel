@@ -8,10 +8,11 @@ use PhpOffice\PhpSpreadsheet\Writer\Xlsx;
 final class XlsxExporter
 {
     /**
-     * @param array<int,string> $templateColumns
-     * @param array<int,array<string,string>> $rows
+     * @param  array<int, string>  $templateColumns  Ключи в $rows
+     * @param  array<int, array<string, string>>  $rows
+     * @param  array<int, string>|null  $headerRow  Подписи в первой строке (если null — как ключи)
      */
-    public function exportToPath(array $templateColumns, array $rows, string $path): void
+    public function exportToPath(array $templateColumns, array $rows, string $path, ?array $headerRow = null): void
     {
         $dir = dirname($path);
         if (!is_dir($dir)) {
@@ -21,9 +22,12 @@ final class XlsxExporter
         $spreadsheet = new Spreadsheet();
         $sheet = $spreadsheet->getActiveSheet();
 
-        // Header row (row 1)
-        foreach ($templateColumns as $i => $col) {
-            $sheet->setCellValueByColumnAndRow($i + 1, 1, $col);
+        $headers = $headerRow !== null && count($headerRow) === count($templateColumns)
+            ? $headerRow
+            : $templateColumns;
+
+        foreach ($headers as $i => $label) {
+            $sheet->setCellValueByColumnAndRow($i + 1, 1, $label);
         }
 
         // Data rows

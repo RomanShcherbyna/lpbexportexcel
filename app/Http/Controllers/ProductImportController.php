@@ -13,19 +13,45 @@ use App\Services\Import\ConfirmedRuleApplier;
 use App\Services\Import\MappingResolutionService;
 use App\Services\Import\NormalizationRulesRepository;
 use App\Services\Import\RowNormalizer;
+use App\Services\Import\SupplierTypeClassificationResolver;
 use App\Services\Export\TemplateLoader;
 use App\Services\Supplier\SupplierMappingLoader;
 use App\Services\Supplier\SupplierRegistry;
 use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
+use Illuminate\Validation\Rule;
 use Symfony\Component\HttpFoundation\StreamedResponse;
 
 final class ProductImportController extends Controller
 {
+    private const GCS_NO_PHOTO = '__NO_PHOTO__';
+
     public function index(SupplierRegistry $registry)
     {
+        $defaultPrefix = $this->normalizeLiewoodGcsFolderPrefix((string) config('liewood_drive.gcs_prefix', ''));
+        $oldPrefix = old('liewood_gcs_prefix');
+        $selectedDefault = ($oldPrefix !== null && (string) $oldPrefix !== '')
+            ? $this->normalizeLiewoodGcsFolderPrefix((string) $oldPrefix)
+            : $defaultPrefix;
+
+        $prefixOptions = $this->discoverGcsPrefixes();
+        $prefixOptions = array_values(array_filter($prefixOptions, fn (string $p): bool => ! $this->isGcsImagesSubfolderPrefix($p)));
+        if ($selectedDefault !== '' && ! in_array($selectedDefault, $prefixOptions, true)) {
+            array_unshift($prefixOptions, $selectedDefault);
+        }
+        if ($prefixOptions === []) {
+            $prefixOptions = [$selectedDefault !== '' ? $selectedDefault : ''];
+        }
+        if (! in_array(self::GCS_NO_PHOTO, $prefixOptions, true)) {
+            array_unshift($prefixOptions, self::GCS_NO_PHOTO);
+        }
+
         return view('imports.index', [
             'suppliers' => $registry->listSuppliers(),
+            'gcs_prefix_options' => $prefixOptions,
+            'gcs_prefix_default' => $selectedDefault,
+            'gcs_no_photo_value' => self::GCS_NO_PHOTO,
         ]);
     }
 
@@ -38,12 +64,15 @@ final class ProductImportController extends Controller
         RowNormalizer $normalizer,
         AiMappingSuggestionService $aiService,
         AiMappingSuggestionParser $aiParser,
+        SupplierTypeClassificationResolver $typeClassificationResolver,
     ) {
         $validated = $request->validate([
             'supplier' => ['required', 'string'],
             'file' => ['required', 'file'],
             'export_xlsx' => ['nullable', 'boolean'],
             'export_csv' => ['nullable', 'boolean'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
+            'liewood_gcs_prefix' => ['required', 'string', 'max:255'],
         ]);
 
         $supplier = (string) $validated['supplier'];
@@ -75,6 +104,15 @@ final class ProductImportController extends Controller
         $configMapping = $this->resolveConfiguredMappingForHeaders($configMapping, $supplierHeaders);
         // Always start from fresh config mapping for UI; no persistent cache.
         $baseSavedMapping = $configMapping;
+
+        $unknownLiewoodTypes = [];
+        if ($supplier === 'liewood') {
+            $unknownLiewoodTypes = $this->unknownLiewoodTypesFromNormalized(
+                $typeClassificationResolver,
+                $baseSavedMapping,
+                $normalized
+            );
+        }
 
         // AI suggestions are disabled for now; keep UI but show clear message.
         $aiUnavailable = 'AI mapping suggestions are disabled.';
@@ -109,6 +147,8 @@ final class ProductImportController extends Controller
                 'supplier_name' => $supplierCfg['supplier_name'],
                 'export_xlsx' => $exportXlsx,
                 'export_csv' => $exportCsv,
+                'liewood_photo_csv_links' => (string) $validated['liewood_photo_csv_links'],
+                'liewood_gcs_prefix' => $this->normalizeLiewoodGcsFolderPrefix((string) $validated['liewood_gcs_prefix']),
             ],
             'template_columns' => $templateColumns,
             'supplier_headers' => $supplierHeaders,
@@ -116,6 +156,7 @@ final class ProductImportController extends Controller
             'ai_suggestions' => array_map(fn ($s) => $s->toArray(), $aiSuggestions),
             'ai_unavailable' => $aiUnavailable,
             'ai_raw_example' => $aiRaw,
+            'unknown_liewood_types' => $unknownLiewoodTypes,
         ]);
     }
 
@@ -128,6 +169,7 @@ final class ProductImportController extends Controller
         AiNormalizationSuggestionParser $aiNormParser,
         NormalizationRulesRepository $rulesRepo,
         ConfirmedRuleApplier $ruleApplier,
+        SupplierTypeClassificationResolver $typeClassificationResolver,
     ) {
         $validated = $request->validate([
             'supplier' => ['required', 'string'],
@@ -136,6 +178,8 @@ final class ProductImportController extends Controller
             'export_xlsx' => ['required', 'boolean'],
             'export_csv' => ['required', 'boolean'],
             'mapping' => ['nullable', 'array'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
+            'liewood_gcs_prefix' => ['required', 'string', 'max:255'],
         ]);
 
         $supplier = (string) $validated['supplier'];
@@ -173,11 +217,45 @@ final class ProductImportController extends Controller
 
         $finalMapping = $resolution['final_mapping'];
 
+        $normalizedRows = app(RowNormalizer::class)->normalizeRows($parsed['rows']);
+
+        if ($supplier === 'liewood') {
+            $unknown = $this->unknownLiewoodTypesFromNormalized(
+                $typeClassificationResolver,
+                $finalMapping,
+                $normalizedRows
+            );
+            if ($unknown !== []) {
+                $hashToRaw = $request->input('unknown_type_hash', []);
+                $typeRes = $request->input('type_resolution', []);
+                if (! is_array($hashToRaw)) {
+                    $hashToRaw = [];
+                }
+                if (! is_array($typeRes)) {
+                    $typeRes = [];
+                }
+                $toSave = [];
+                foreach ($unknown as $raw) {
+                    $h = md5($raw);
+                    if (($hashToRaw[$h] ?? null) !== $raw) {
+                        return back()->withErrors(['type_resolution' => 'Invalid type classification payload.'])->withInput();
+                    }
+                    $bucket = $typeRes[$h] ?? null;
+                    if (! in_array($bucket, ['footwear', 'hat', 'socks', 'generic'], true)) {
+                        return back()->withErrors([
+                            'type_resolution' => 'Classify every unknown Type value (see block above the mapping table). Missing: '.$raw,
+                        ])->withInput();
+                    }
+                    $toSave[$raw] = $bucket;
+                }
+                $typeClassificationResolver->saveResolutions($supplier, $toSave);
+            }
+        }
+
         $exportXlsx = (bool)$validated['export_xlsx'];
         $exportCsv = (bool)$validated['export_csv'];
 
         $templateColumns = app(TemplateLoader::class)->loadTemplateColumns((string)config('product_import.template_path'));
-        $normalizedRows = app(RowNormalizer::class)->normalizeRows($parsed['rows']);
         $mapped = app(\App\Services\Import\RowMapper::class)->map($normalizedRows, $finalMapping, $templateColumns);
         $mappedRows = $mapped['output_rows'];
 
@@ -238,6 +316,8 @@ final class ProductImportController extends Controller
                 'export_xlsx' => $exportXlsx,
                 'export_csv' => $exportCsv,
                 'mapping' => $finalMapping,
+                'liewood_photo_csv_links' => (string) $validated['liewood_photo_csv_links'],
+                'liewood_gcs_prefix' => $this->normalizeLiewoodGcsFolderPrefix((string) $validated['liewood_gcs_prefix']),
             ],
             'rules' => $rules,
             'ai_unavailable' => $aiUnavailable,
@@ -259,6 +339,8 @@ final class ProductImportController extends Controller
             'export_csv' => ['required', 'boolean'],
             'mapping' => ['nullable', 'array'],
             'rules' => ['nullable', 'array'],
+            'liewood_photo_csv_links' => ['required', 'string', Rule::in(['preview', 'download'])],
+            'liewood_gcs_prefix' => ['required', 'string', 'max:255'],
         ]);
 
         $supplier = (string) $validated['supplier'];
@@ -341,6 +423,9 @@ final class ProductImportController extends Controller
         );
         // #endregion
 
+        $liewoodGcsUseDownloadProxy = $validated['liewood_photo_csv_links'] === 'download';
+        $liewoodGcsPrefix = $this->normalizeLiewoodGcsFolderPrefix((string) $validated['liewood_gcs_prefix']);
+
         $job = $pipeline->run(
             $supplier,
             $inputPath,
@@ -348,6 +433,8 @@ final class ProductImportController extends Controller
             (bool)$validated['export_xlsx'],
             (bool)$validated['export_csv'],
             $effectiveMapping,
+            $liewoodGcsUseDownloadProxy,
+            $liewoodGcsPrefix,
         );
 
         // #region agent log
@@ -412,6 +499,96 @@ final class ProductImportController extends Controller
             }
             fclose($fh);
         }, basename($path));
+    }
+
+    public function downloadInstructionCsv(string $job): StreamedResponse
+    {
+        $jobDir = rtrim((string) config('product_import.jobs_dir'), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $job;
+        $path = $jobDir . DIRECTORY_SEPARATOR . (string) config('product_import.export.instruction_csv_name', 'instruction.csv');
+
+        if (! file_exists($path)) {
+            abort(404);
+        }
+
+        return response()->streamDownload(function () use ($path): void {
+            $fh = fopen($path, 'rb');
+            if ($fh === false) {
+                return;
+            }
+            while (! feof($fh)) {
+                echo fread($fh, 1024 * 1024);
+            }
+            fclose($fh);
+        }, basename($path));
+    }
+
+    /**
+     * Колонка шаблона, куда маппится Liewood Type (retail vs legacy master).
+     */
+    private function liewoodTypeTargetTemplateColumn(): string
+    {
+        $isRetail = filter_var(env('LIEWOOD_RETAIL_EXPORT', true), FILTER_VALIDATE_BOOLEAN);
+
+        return $isRetail ? 'item SubCategory' : 'item_category';
+    }
+
+    /**
+     * Исходные заголовки файла, из которых берётся Type.
+     *
+     * @param  array<string, string>  $resolvedSourceToTemplate
+     * @return list<string>
+     */
+    private function liewoodTypeSourceColumns(array $resolvedSourceToTemplate): array
+    {
+        $target = $this->liewoodTypeTargetTemplateColumn();
+        $cols = [];
+        foreach ($resolvedSourceToTemplate as $src => $dst) {
+            if ($dst === $target) {
+                $cols[] = $src;
+            }
+        }
+
+        return $cols;
+    }
+
+    /**
+     * Значения Type из файла, которых нет в конфиге liewood_retail и не сохранено в БД.
+     *
+     * @param  array<string, string>  $resolvedMapping
+     * @param  array<int, array<string, string>>  $normalizedRows
+     * @return list<string>
+     */
+    private function unknownLiewoodTypesFromNormalized(
+        SupplierTypeClassificationResolver $resolver,
+        array $resolvedMapping,
+        array $normalizedRows,
+    ): array {
+        $cols = $this->liewoodTypeSourceColumns($resolvedMapping);
+        if ($cols === []) {
+            return [];
+        }
+
+        $distinct = [];
+        foreach ($normalizedRows as $row) {
+            foreach ($cols as $col) {
+                $t = trim((string) ($row[$col] ?? ''));
+                if ($t !== '') {
+                    $distinct[$t] = true;
+                }
+            }
+        }
+
+        $known = $resolver->knownTypeKeysMap('liewood');
+        $unknown = [];
+        foreach (array_keys($distinct) as $v) {
+            $k = mb_strtoupper((string) $v);
+            if (! isset($known[$k])) {
+                $unknown[] = (string) $v;
+            }
+        }
+        sort($unknown);
+
+        return $unknown;
     }
 
     private function loadSavedMappingOverride(string $supplier): ?array
@@ -545,6 +722,100 @@ final class ProductImportController extends Controller
         // #endregion
 
         return $resolved;
+    }
+
+    /**
+     * Уровень папки сезона в GCS (без суффикса /images/).
+     * Объекты под `season/.../images/...` всё равно попадают в list с prefix=season/.
+     */
+    private function normalizeLiewoodGcsFolderPrefix(string $prefix): string
+    {
+        $p = ltrim(trim($prefix), '/');
+        if ($p === self::GCS_NO_PHOTO) {
+            return self::GCS_NO_PHOTO;
+        }
+        if ($p === '') {
+            return '';
+        }
+        if (preg_match('#(^|/)images/?$#i', $p)) {
+            $p = (string) preg_replace('#/images/?$#i', '', $p);
+        }
+        $p = rtrim($p, '/');
+
+        return $p === '' ? '' : $p.'/';
+    }
+
+    private function isGcsImagesSubfolderPrefix(string $prefix): bool
+    {
+        $p = rtrim(trim($prefix), '/');
+        if ($p === '') {
+            return false;
+        }
+
+        return str_ends_with(strtolower($p), '/images')
+            || strtolower(basename(str_replace('\\', '/', $p))) === 'images';
+    }
+
+    /**
+     * @return list<string>
+     */
+    private function discoverGcsPrefixes(): array
+    {
+        $bucket = trim((string) config('liewood_drive.gcs_bucket', ''));
+        $rootPrefix = ltrim(trim((string) config('liewood_drive.gcs_prefix_root', '')), '/');
+        if ($bucket === '') {
+            return [];
+        }
+
+        $prefixes = [];
+        $pageToken = null;
+        $maxPages = 20;
+
+        try {
+            for ($page = 0; $page < $maxPages; $page++) {
+                $query = [
+                    'delimiter' => '/',
+                    'maxResults' => 1000,
+                ];
+                if ($rootPrefix !== '') {
+                    $query['prefix'] = $rootPrefix;
+                }
+                if (is_string($pageToken) && $pageToken !== '') {
+                    $query['pageToken'] = $pageToken;
+                }
+
+                $url = 'https://storage.googleapis.com/storage/v1/b/'.rawurlencode($bucket).'/o';
+                $resp = Http::timeout(10)->get($url, $query);
+                if (! $resp->successful()) {
+                    break;
+                }
+
+                $json = $resp->json();
+                if (! is_array($json)) {
+                    break;
+                }
+
+                foreach ((array) ($json['prefixes'] ?? []) as $p) {
+                    $v = trim((string) $p);
+                    if ($v !== '') {
+                        $prefixes[$v] = true;
+                    }
+                }
+
+                $pageToken = (string) ($json['nextPageToken'] ?? '');
+                if ($pageToken === '') {
+                    break;
+                }
+            }
+        } catch (\Throwable) {
+            // If GCS listing is unavailable, fallback to configured default prefix.
+        }
+
+        $out = array_keys($prefixes);
+        $out = array_values(array_filter($out, fn (string $p): bool => ! $this->isGcsImagesSubfolderPrefix($p)));
+        sort($out, SORT_NATURAL | SORT_FLAG_CASE);
+
+        return $out;
     }
 }
 

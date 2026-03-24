@@ -20,33 +20,10 @@ final class RowMapper
         $templateSet = array_fill_keys($templateColumns, true);
         $sourceKeyMap = $this->buildSourceKeyMap($supplierRows);
 
-        // Validate mapping targets belong to template.
-        foreach ($columnMapping as $src => $dst) {
-            if (!isset($templateSet[$dst])) {
-                // #region agent log
-                @file_put_contents(
-                    base_path('.cursor/debug-9a7511.log'),
-                    json_encode([
-                        'sessionId' => '9a7511',
-                        'runId' => 'debug-brand-sku',
-                        'hypothesisId' => 'H5',
-                        'location' => 'LPB/app/Services/Import/RowMapper.php:map',
-                        'message' => 'Mapping target missing in template set',
-                        'data' => [
-                            'source' => $src,
-                            'target' => $dst,
-                            'target_trimmed' => trim((string)$dst),
-                            'template_contains_target' => isset($templateSet[$dst]),
-                            'template_contains_target_trimmed' => isset($templateSet[trim((string)$dst)]),
-                        ],
-                        'timestamp' => (int) (microtime(true) * 1000),
-                    ]) . PHP_EOL,
-                    FILE_APPEND
-                );
-                // #endregion
-                throw new InvalidArgumentException("Mapping target not in template: '{$dst}' (source '{$src}')");
-            }
-        }
+        // Mapping robustness:
+        // If template headers changed and a previously selected mapping target no longer exists,
+        // we must not crash the whole pipeline. We'll just skip assigning such columns.
+        // Export will still be correct because it iterates strictly over $templateColumns.
 
         $outputRows = [];
 
@@ -62,6 +39,11 @@ final class RowMapper
                     // Missing source column => keep empty.
                     continue;
                 }
+                if (!isset($templateSet[$dst])) {
+                    // Unknown target in current template headers (headers updated) => skip.
+                    continue;
+                }
+
                 $out[$dst] = $row[$resolvedSrc];
             }
 

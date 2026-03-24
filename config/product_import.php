@@ -75,6 +75,8 @@ return [
         'csv_name' => 'output.csv',
         'preview_json' => 'preview.json',
         'errors_json' => 'errors.json',
+        'instruction_csv_name' => 'instruction.csv',
+        'instruction_passport_json' => 'instruction_passport.json',
     ],
     'validation' => [
         'required_columns' => [
